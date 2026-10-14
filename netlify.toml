@@ -1,0 +1,27 @@
+[build]
+  # Install all deps + build the React frontend
+  command = "npm install && cd server && npm install && cd ../client && npm install && npm run build"
+  # Publish the Vite output directory as static site
+  publish = "client/dist"
+  # Netlify Functions directory
+  functions = "netlify/functions"
+
+[build.environment]
+  # Node version for build
+  NODE_VERSION = "18"
+
+# Configure functions to use esbuild bundler (handles node_modules properly)
+[functions]
+  node_bundler = "esbuild"
+
+# Redirect all /api/* requests to the serverless function
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+
+# SPA fallback: all other routes serve index.html (client-side routing)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
