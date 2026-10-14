@@ -8,7 +8,7 @@
 
 [build.environment]
   # Node version for build
-  NODE_VERSION = "18"
+  NODE_VERSION = "22"
 
 # Configure functions to use esbuild bundler (handles node_modules properly)
 [functions]
