@@ -5,7 +5,6 @@
  */
 const http = require('node:http');
 const app = require('../server');
-const { getDb } = require('../config/database');
 
 let server;
 let baseUrl;
@@ -64,10 +63,10 @@ async function runTests() {
 
   // Ensure test idempotency by clearing any previous test artifacts for prj_solarpulse
   try {
-    const db = getDb();
-    db.prepare(`DELETE FROM mentorship_requests WHERE project_id = 'prj_solarpulse'`).run();
-    db.prepare(`DELETE FROM funding_requests WHERE project_id = 'prj_solarpulse'`).run();
-    db.prepare(`DELETE FROM expenses WHERE project_id = 'prj_solarpulse'`).run();
+    const { supabase } = require('../config/supabaseClient');
+    await supabase.from('mentorship_requests').delete().eq('project_id', 'prj_solarpulse');
+    await supabase.from('funding_requests').delete().eq('project_id', 'prj_solarpulse');
+    await supabase.from('expenses').delete().eq('project_id', 'prj_solarpulse');
   } catch (err) {
     console.warn('DB cleanup warning:', err.message);
   }
