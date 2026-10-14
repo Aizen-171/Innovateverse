@@ -1,0 +1,21 @@
+{
+  "name": "innovateverse",
+  "version": "1.0.0",
+  "description": "INNOVATEVERSE - AI-Powered Campus Innovation Platform",
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node server/tests/api.test.js",
+    "build": "npm --prefix client run build",
+    "client:dev": "npm --prefix client run dev",
+    "server:dev": "npm --prefix server run dev"
+  },
+  "keywords": [
+    "campus-innovation",
+    "ai-copilot",
+    "hackathon",
+    "react",
+    "sqlite"
+  ],
+  "author": "InnovateVerse Engineering Team",
+  "license": "MIT"
+}
