@@ -1,8 +1,10 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('node:path');
-const { initDatabase, getDb } = require('./config/database');
-const { seedDatabase } = require('./seeds/seedData');
+require('dotenv').config();
+
+const { supabase } = require('./config/supabaseClient');
+const { seedSupabase } = require('./seeds/seedSupabase');
 const { requireAuth, optionalAuth } = require('./middleware/auth');
 const { requireRole } = require('./middleware/rbac');
 
@@ -25,9 +27,8 @@ const copilotCtrl = require('./controllers/copilotController');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Initialize Database & Seed
-const db = initDatabase();
-seedDatabase(db);
+// Initialize Supabase Seed (Async check in background)
+seedSupabase().catch(err => console.warn('Supabase initial seed check:', err.message));
 
 // Middleware
 app.use(cors());
@@ -50,31 +51,34 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    platform: 'InnovateVerse Campus Innovation Platform'
+    platform: 'InnovateVerse Campus Innovation Platform',
+    database: 'Supabase PostgreSQL Cloud'
   });
 });
 
-// Platform Real Statistics Endpoint (Never fabricated!)
-app.get('/api/stats', (req, res) => {
+// Platform Real Statistics Endpoint (Direct from Supabase)
+app.get('/api/stats', async (req, res) => {
   try {
-    const db = getDb();
-    const totalProjects = db.prepare('SELECT COUNT(*) as count FROM projects').get().count;
-    const totalChallenges = db.prepare("SELECT COUNT(*) as count FROM challenges WHERE status = 'active'").get().count;
-    const totalStudents = db.prepare("SELECT COUNT(*) as count FROM users WHERE role IN ('student', 'contributor')").get().count;
-    const totalMilestones = db.prepare("SELECT COUNT(*) as count FROM milestones WHERE status = 'completed'").get().count;
-    const totalReviews = db.prepare('SELECT COUNT(*) as count FROM reviews').get().count;
+    const { count: totalProjects } = await supabase.from('projects').select('*', { count: 'exact', head: true });
+    const { count: totalChallenges } = await supabase.from('challenges').select('*', { count: 'exact', head: true }).eq('status', 'active');
+    const { count: totalStudents } = await supabase.from('users').select('*', { count: 'exact', head: true }).in('role', ['student', 'contributor']);
+    const { count: totalMilestones } = await supabase.from('milestones').select('*', { count: 'exact', head: true }).eq('status', 'completed');
+    const { count: totalReviews } = await supabase.from('reviews').select('*', { count: 'exact', head: true });
 
-    const totalFundingApproved = db.prepare("SELECT COALESCE(SUM(approved_amount), 0) as total FROM funding_requests WHERE status IN ('Approved', 'Released')").get().total;
-    const totalVerifiedExpenses = db.prepare("SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE status = 'Verified'").get().total;
+    const { data: fundings } = await supabase.from('funding_requests').select('approved_amount').in('status', ['Approved', 'Released']);
+    const totalFundingApproved = (fundings || []).reduce((acc, f) => acc + Number(f.approved_amount || 0), 0);
+
+    const { data: expenses } = await supabase.from('expenses').select('amount').eq('status', 'Verified');
+    const totalVerifiedExpenses = (expenses || []).reduce((acc, e) => acc + Number(e.amount || 0), 0);
 
     res.json({
       success: true,
       stats: {
-        totalProjects,
-        totalChallenges,
-        totalStudents,
-        completedMilestones: totalMilestones,
-        facultyReviews: totalReviews,
+        totalProjects: totalProjects || 0,
+        totalChallenges: totalChallenges || 0,
+        totalStudents: totalStudents || 0,
+        completedMilestones: totalMilestones || 0,
+        facultyReviews: totalReviews || 0,
         totalFundingApproved,
         totalVerifiedExpenses
       }
@@ -177,7 +181,7 @@ app.use((err, req, res, next) => {
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`🚀 InnovateVerse Server running on http://localhost:${PORT}`);
+    console.log(`🚀 InnovateVerse Server running on http://localhost:${PORT} with Supabase backend`);
   });
 }
 

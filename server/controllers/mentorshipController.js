@@ -1,24 +1,27 @@
 const crypto = require('node:crypto');
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 const { sanitizeUser } = require('../services/authService');
 
-function getAvailableMentors(req, res) {
+async function getAvailableMentors(req, res) {
   try {
-    const db = getDb();
-    const mentors = db.prepare(`
-      SELECT * FROM users WHERE role = 'mentor'
-    `).all();
+    const { data: mentors, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('role', 'mentor');
+
+    if (error) throw error;
 
     return res.json({
       success: true,
-      mentors: mentors.map(m => sanitizeUser(m))
+      mentors: (mentors || []).map(m => sanitizeUser(m))
     });
   } catch (err) {
+    console.error('Get mentors error:', err);
     return res.status(500).json({ success: false, error: 'Failed to fetch mentors.' });
   }
 }
 
-function requestMentorship(req, res) {
+async function requestMentorship(req, res) {
   try {
     const { project_id, mentor_id, assistance_needed } = req.body;
 
@@ -29,27 +32,37 @@ function requestMentorship(req, res) {
       });
     }
 
-    const db = getDb();
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(project_id);
-    if (!project) {
+    const { data: project, error: pError } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', project_id)
+      .maybeSingle();
+
+    if (pError || !project) {
       return res.status(404).json({ success: false, error: 'Project not found.' });
     }
 
-    // Must be project owner or member
     if (project.owner_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ success: false, error: 'Only the project lead can request faculty mentorship.' });
     }
 
-    const mentor = db.prepare('SELECT id, full_name, role FROM users WHERE id = ?').get(mentor_id);
-    if (!mentor || mentor.role !== 'mentor') {
+    const { data: mentor, error: mError } = await supabase
+      .from('users')
+      .select('id, full_name, role')
+      .eq('id', mentor_id)
+      .maybeSingle();
+
+    if (mError || !mentor || mentor.role !== 'mentor') {
       return res.status(400).json({ success: false, error: 'Selected user is not an active faculty mentor.' });
     }
 
-    // Prevent duplicate pending requests for the same project & mentor
-    const existing = db.prepare(`
-      SELECT * FROM mentorship_requests
-      WHERE project_id = ? AND mentor_id = ? AND status IN ('Requested', 'Accepted', 'In Progress')
-    `).get(project_id, mentor_id);
+    const { data: existing } = await supabase
+      .from('mentorship_requests')
+      .select('*')
+      .eq('project_id', project_id)
+      .eq('mentor_id', mentor_id)
+      .in('status', ['Requested', 'Accepted', 'In Progress'])
+      .maybeSingle();
 
     if (existing) {
       return res.status(409).json({
@@ -59,14 +72,22 @@ function requestMentorship(req, res) {
     }
 
     const id = `men_${crypto.randomBytes(6).toString('hex')}`;
-    const insert = db.prepare(`
-      INSERT INTO mentorship_requests (id, project_id, student_id, mentor_id, assistance_needed, status)
-      VALUES (?, ?, ?, ?, ?, 'Requested')
-    `);
+    const newRequest = {
+      id,
+      project_id,
+      student_id: req.user.id,
+      mentor_id,
+      assistance_needed: assistance_needed.trim(),
+      status: 'Requested'
+    };
 
-    insert.run(id, project_id, req.user.id, mentor_id, assistance_needed.trim());
+    const { data: created, error: insertError } = await supabase
+      .from('mentorship_requests')
+      .insert(newRequest)
+      .select()
+      .single();
 
-    const created = db.prepare('SELECT * FROM mentorship_requests WHERE id = ?').get(id);
+    if (insertError) throw insertError;
 
     return res.status(201).json({
       success: true,
@@ -79,64 +100,74 @@ function requestMentorship(req, res) {
   }
 }
 
-function getMyMentorshipRequests(req, res) {
+async function getMyMentorshipRequests(req, res) {
   try {
-    const db = getDb();
-    let query = '';
-    let params = [];
-
     if (req.user.role === 'mentor') {
-      // Mentors see requests addressed to them
-      query = `
-        SELECT mr.*,
-          p.title as project_title,
-          p.slug as project_slug,
-          p.category as project_category,
-          p.stage as project_stage,
-          u.full_name as student_name,
-          u.email as student_email,
-          u.department as student_department,
-          u.avatar_url as student_avatar
-        FROM mentorship_requests mr
-        JOIN projects p ON mr.project_id = p.id
-        JOIN users u ON mr.student_id = u.id
-        WHERE mr.mentor_id = ?
-        ORDER BY mr.created_at DESC
-      `;
-      params = [req.user.id];
-    } else {
-      // Students see requests they created
-      query = `
-        SELECT mr.*,
-          p.title as project_title,
-          p.slug as project_slug,
-          p.category as project_category,
-          p.stage as project_stage,
-          m.full_name as mentor_name,
-          m.email as mentor_email,
-          m.department as mentor_department,
-          m.avatar_url as mentor_avatar
-        FROM mentorship_requests mr
-        JOIN projects p ON mr.project_id = p.id
-        JOIN users m ON mr.mentor_id = m.id
-        WHERE mr.student_id = ?
-        ORDER BY mr.created_at DESC
-      `;
-      params = [req.user.id];
-    }
+      const { data: requests, error } = await supabase
+        .from('mentorship_requests')
+        .select(`
+          *,
+          projects!project_id (title, slug, category, stage),
+          users!student_id (full_name, email, department, avatar_url)
+        `)
+        .eq('mentor_id', req.user.id)
+        .order('created_at', { ascending: false });
 
-    const requests = db.prepare(query).all(...params);
-    return res.json({
-      success: true,
-      requests
-    });
+      if (error) throw error;
+
+      const formatted = (requests || []).map(r => ({
+        ...r,
+        project_title: r.projects ? r.projects.title : null,
+        project_slug: r.projects ? r.projects.slug : null,
+        project_category: r.projects ? r.projects.category : null,
+        project_stage: r.projects ? r.projects.stage : null,
+        student_name: r.users ? r.users.full_name : null,
+        student_email: r.users ? r.users.email : null,
+        student_department: r.users ? r.users.department : null,
+        student_avatar: r.users ? r.users.avatar_url : null
+      }));
+
+      return res.json({
+        success: true,
+        requests: formatted
+      });
+    } else {
+      const { data: requests, error } = await supabase
+        .from('mentorship_requests')
+        .select(`
+          *,
+          projects!project_id (title, slug, category, stage),
+          users!mentor_id (full_name, email, department, avatar_url)
+        `)
+        .eq('student_id', req.user.id)
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+
+      const formatted = (requests || []).map(r => ({
+        ...r,
+        project_title: r.projects ? r.projects.title : null,
+        project_slug: r.projects ? r.projects.slug : null,
+        project_category: r.projects ? r.projects.category : null,
+        project_stage: r.projects ? r.projects.stage : null,
+        mentor_name: r.users ? r.users.full_name : null,
+        mentor_email: r.users ? r.users.email : null,
+        mentor_department: r.users ? r.users.department : null,
+        mentor_avatar: r.users ? r.users.avatar_url : null
+      }));
+
+      return res.json({
+        success: true,
+        requests: formatted
+      });
+    }
   } catch (err) {
     console.error('Error fetching mentorship requests:', err);
     return res.status(500).json({ success: false, error: 'Failed to retrieve mentorship requests.' });
   }
 }
 
-function respondToMentorshipRequest(req, res) {
+async function respondToMentorshipRequest(req, res) {
   try {
     const { id } = req.params;
     const { status, mentor_notes } = req.body;
@@ -149,29 +180,34 @@ function respondToMentorshipRequest(req, res) {
       });
     }
 
-    const db = getDb();
-    const request = db.prepare('SELECT * FROM mentorship_requests WHERE id = ?').get(id);
+    const { data: request, error: rError } = await supabase
+      .from('mentorship_requests')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
 
-    if (!request) {
+    if (rError || !request) {
       return res.status(404).json({ success: false, error: 'Mentorship request not found.' });
     }
 
-    // Only assigned mentor or admin can update status
     if (request.mentor_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ success: false, error: 'Only the assigned faculty mentor can update this request.' });
     }
 
-    const update = db.prepare(`
-      UPDATE mentorship_requests SET
-        status = ?,
-        mentor_notes = COALESCE(?, mentor_notes),
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `);
+    const updates = {
+      status,
+      updated_at: new Date().toISOString()
+    };
+    if (mentor_notes !== undefined) updates.mentor_notes = mentor_notes ? mentor_notes.trim() : null;
 
-    update.run(status, mentor_notes ? mentor_notes.trim() : null, id);
+    const { data: updated, error: updateError } = await supabase
+      .from('mentorship_requests')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
 
-    const updated = db.prepare('SELECT * FROM mentorship_requests WHERE id = ?').get(id);
+    if (updateError) throw updateError;
 
     return res.json({
       success: true,
@@ -184,28 +220,35 @@ function respondToMentorshipRequest(req, res) {
   }
 }
 
-function getProjectMentorship(req, res) {
+async function getProjectMentorship(req, res) {
   try {
     const { projectId } = req.params;
-    const db = getDb();
 
-    const requests = db.prepare(`
-      SELECT mr.*,
-        m.full_name as mentor_name,
-        m.email as mentor_email,
-        m.department as mentor_department,
-        m.avatar_url as mentor_avatar
-      FROM mentorship_requests mr
-      JOIN users m ON mr.mentor_id = m.id
-      WHERE mr.project_id = ?
-      ORDER BY mr.created_at DESC
-    `).all(projectId);
+    const { data: requests, error } = await supabase
+      .from('mentorship_requests')
+      .select(`
+        *,
+        users!mentor_id (full_name, email, department, avatar_url)
+      `)
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const formatted = (requests || []).map(r => ({
+      ...r,
+      mentor_name: r.users ? r.users.full_name : null,
+      mentor_email: r.users ? r.users.email : null,
+      mentor_department: r.users ? r.users.department : null,
+      mentor_avatar: r.users ? r.users.avatar_url : null
+    }));
 
     return res.json({
       success: true,
-      mentorships: requests
+      mentorships: formatted
     });
   } catch (err) {
+    console.error('Get project mentorship error:', err);
     return res.status(500).json({ success: false, error: 'Failed to fetch project mentorship details.' });
   }
 }

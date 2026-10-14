@@ -1,41 +1,62 @@
 const crypto = require('node:crypto');
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 
-function verifyTeamAccess(db, projectId, userId, userRole) {
+async function verifyTeamAccess(projectId, userId, userRole) {
   if (userRole === 'admin') return true;
-  const project = db.prepare('SELECT owner_id FROM projects WHERE id = ?').get(projectId);
+
+  const { data: project } = await supabase
+    .from('projects')
+    .select('owner_id')
+    .eq('id', projectId)
+    .maybeSingle();
+
   if (!project) return false;
   if (project.owner_id === userId) return true;
 
-  const membership = db.prepare(`
-    SELECT 1 FROM collaborations WHERE project_id = ? AND user_id = ? AND status = 'accepted'
-  `).get(projectId, userId);
+  const { data: membership } = await supabase
+    .from('collaborations')
+    .select('id')
+    .eq('project_id', projectId)
+    .eq('user_id', userId)
+    .eq('status', 'accepted')
+    .maybeSingle();
 
   return !!membership;
 }
 
-function toggleMilestone(req, res) {
+async function toggleMilestone(req, res) {
   try {
     const { id } = req.params;
-    const db = getDb();
 
-    const milestone = db.prepare('SELECT * FROM milestones WHERE id = ?').get(id);
-    if (!milestone) {
+    const { data: milestone, error: mError } = await supabase
+      .from('milestones')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (mError || !milestone) {
       return res.status(404).json({ success: false, error: 'Milestone not found.' });
     }
 
-    if (!verifyTeamAccess(db, milestone.project_id, req.user.id, req.user.role)) {
+    const hasAccess = await verifyTeamAccess(milestone.project_id, req.user.id, req.user.role);
+    if (!hasAccess) {
       return res.status(403).json({ success: false, error: 'Only team members can update milestones.' });
     }
 
     const newStatus = milestone.status === 'completed' ? 'planned' : 'completed';
     const completedAt = newStatus === 'completed' ? new Date().toISOString() : null;
 
-    db.prepare(`
-      UPDATE milestones SET status = ?, completed_at = ? WHERE id = ?
-    `).run(newStatus, completedAt, id);
+    const { data: updated, error: updateError } = await supabase
+      .from('milestones')
+      .update({
+        status: newStatus,
+        completed_at: completedAt
+      })
+      .eq('id', id)
+      .select()
+      .single();
 
-    const updated = db.prepare('SELECT * FROM milestones WHERE id = ?').get(id);
+    if (updateError) throw updateError;
 
     return res.json({
       success: true,
@@ -47,7 +68,7 @@ function toggleMilestone(req, res) {
   }
 }
 
-function createMilestone(req, res) {
+async function createMilestone(req, res) {
   try {
     const { projectId } = req.params;
     const { title, description, target_day = 7 } = req.body;
@@ -56,30 +77,48 @@ function createMilestone(req, res) {
       return res.status(400).json({ success: false, error: 'Milestone title is required.' });
     }
 
-    const db = getDb();
-    if (!verifyTeamAccess(db, projectId, req.user.id, req.user.role)) {
+    const hasAccess = await verifyTeamAccess(projectId, req.user.id, req.user.role);
+    if (!hasAccess) {
       return res.status(403).json({ success: false, error: 'Only team members can add milestones.' });
     }
 
-    const count = db.prepare('SELECT COUNT(*) as c FROM milestones WHERE project_id = ?').get(projectId).c;
+    const { data: currentMilestones } = await supabase
+      .from('milestones')
+      .select('id')
+      .eq('project_id', projectId);
+
+    const count = (currentMilestones || []).length;
     const id = `mls_${crypto.randomBytes(5).toString('hex')}`;
 
-    db.prepare(`
-      INSERT INTO milestones (id, project_id, title, description, target_day, status, sort_order)
-      VALUES (?, ?, ?, ?, ?, 'planned', ?)
-    `).run(id, projectId, title.trim(), description || '', Number(target_day) || 7, count + 1);
+    const newMilestone = {
+      id,
+      project_id: projectId,
+      title: title.trim(),
+      description: description || '',
+      target_day: Number(target_day) || 7,
+      status: 'planned',
+      sort_order: count + 1
+    };
 
-    const created = db.prepare('SELECT * FROM milestones WHERE id = ?').get(id);
+    const { data: created, error } = await supabase
+      .from('milestones')
+      .insert(newMilestone)
+      .select()
+      .single();
+
+    if (error) throw error;
+
     return res.status(201).json({
       success: true,
       milestone: created
     });
   } catch (err) {
+    console.error('Create milestone error:', err);
     return res.status(500).json({ success: false, error: 'Failed to create milestone.' });
   }
 }
 
-function applyCopilotMilestones(req, res) {
+async function applyCopilotMilestones(req, res) {
   try {
     const { projectId } = req.params;
     const { milestones } = req.body;
@@ -88,25 +127,34 @@ function applyCopilotMilestones(req, res) {
       return res.status(400).json({ success: false, error: 'No milestones provided to import.' });
     }
 
-    const db = getDb();
-    if (!verifyTeamAccess(db, projectId, req.user.id, req.user.role)) {
+    const hasAccess = await verifyTeamAccess(projectId, req.user.id, req.user.role);
+    if (!hasAccess) {
       return res.status(403).json({ success: false, error: 'Only team leads can apply milestones.' });
     }
 
-    const currentCount = db.prepare('SELECT COUNT(*) as c FROM milestones WHERE project_id = ?').get(projectId).c;
-    const insert = db.prepare(`
-      INSERT INTO milestones (id, project_id, title, description, target_day, status, sort_order)
-      VALUES (?, ?, ?, ?, ?, 'planned', ?)
-    `);
+    const { data: currentMilestones } = await supabase
+      .from('milestones')
+      .select('id')
+      .eq('project_id', projectId);
 
-    const inserted = [];
-    milestones.forEach((m, idx) => {
-      const id = `mls_${crypto.randomBytes(5).toString('hex')}`;
-      const sortOrder = currentCount + idx + 1;
-      const targetDays = m.targetDays || m.target_day || (idx + 1) * 7;
-      insert.run(id, projectId, m.title, m.description || '', targetDays, sortOrder);
-      inserted.push({ id, title: m.title, description: m.description, target_day: targetDays, status: 'planned', sort_order: sortOrder });
-    });
+    const currentCount = (currentMilestones || []).length;
+
+    const rowsToInsert = milestones.map((m, idx) => ({
+      id: `mls_${crypto.randomBytes(5).toString('hex')}`,
+      project_id: projectId,
+      title: m.title || `Milestone ${idx + 1}`,
+      description: m.description || '',
+      target_day: m.targetDays || m.target_day || (idx + 1) * 7,
+      status: 'planned',
+      sort_order: currentCount + idx + 1
+    }));
+
+    const { data: inserted, error } = await supabase
+      .from('milestones')
+      .insert(rowsToInsert)
+      .select();
+
+    if (error) throw error;
 
     return res.json({
       success: true,

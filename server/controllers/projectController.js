@@ -1,7 +1,9 @@
 const crypto = require('node:crypto');
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 
 function safeParse(str) {
+  if (Array.isArray(str)) return str;
+  if (!str) return [];
   try {
     return JSON.parse(str) || [];
   } catch {
@@ -19,70 +21,77 @@ function formatProject(p) {
   };
 }
 
-function getAllProjects(req, res) {
+async function getAllProjects(req, res) {
   try {
-    const db = getDb();
     const { q, category, stage, skill, recruiting, owner_id } = req.query;
 
-    let query = `
-      SELECT p.*, 
-        u.full_name as owner_name, 
-        u.avatar_url as owner_avatar,
-        u.department as owner_department,
-        c.title as challenge_title,
-        (SELECT COUNT(*) FROM milestones m WHERE m.project_id = p.id) as total_milestones,
-        (SELECT COUNT(*) FROM milestones m WHERE m.project_id = p.id AND m.status = 'completed') as completed_milestones,
-        (SELECT COUNT(*) FROM collaborations cb WHERE cb.project_id = p.id AND cb.status = 'accepted') as team_count
-      FROM projects p
-      JOIN users u ON p.owner_id = u.id
-      LEFT JOIN challenges c ON p.challenge_id = c.id
-      WHERE 1=1
-    `;
-    const params = [];
+    let query = supabase
+      .from('projects')
+      .select(`
+        *,
+        users!owner_id (full_name, avatar_url, department),
+        challenges (title),
+        milestones (id, status),
+        collaborations (id, status)
+      `)
+      .order('upvotes_count', { ascending: false })
+      .order('created_at', { ascending: false });
 
     // Filter by visibility (private projects only visible to owner)
     if (owner_id && req.user && req.user.id === owner_id) {
-      query += ' AND p.owner_id = ?';
-      params.push(owner_id);
+      query = query.eq('owner_id', owner_id);
     } else {
-      query += " AND p.visibility = 'public'";
+      query = query.eq('visibility', 'public');
       if (owner_id) {
-        query += ' AND p.owner_id = ?';
-        params.push(owner_id);
+        query = query.eq('owner_id', owner_id);
       }
     }
 
     if (category) {
-      query += ' AND p.category = ?';
-      params.push(category);
+      query = query.eq('category', category);
     }
 
     if (stage) {
-      query += ' AND p.stage = ?';
-      params.push(stage);
+      query = query.eq('stage', stage);
     }
 
     if (q) {
-      query += ' AND (p.title LIKE ? OR p.tagline LIKE ? OR p.problem_statement LIKE ? OR p.tech_stack_json LIKE ?)';
-      const term = `%${q}%`;
-      params.push(term, term, term, term);
+      query = query.or(`title.ilike.%${q}%,tagline.ilike.%${q}%,problem_statement.ilike.%${q}%,tech_stack_json.ilike.%${q}%`);
     }
 
     if (skill) {
-      query += ' AND p.skills_needed_json LIKE ?';
-      params.push(`%${skill}%`);
+      query = query.ilike('skills_needed_json', `%${skill}%`);
     }
+
+    const { data: projects, error } = await query;
+    if (error) throw error;
+
+    let results = projects.map(p => {
+      const allM = p.milestones || [];
+      const acceptedCollabs = (p.collaborations || []).filter(c => c.status === 'accepted');
+
+      return {
+        ...p,
+        owner_name: p.users ? p.users.full_name : null,
+        owner_avatar: p.users ? p.users.avatar_url : null,
+        owner_department: p.users ? p.users.department : null,
+        challenge_title: p.challenges ? p.challenges.title : null,
+        total_milestones: allM.length,
+        completed_milestones: allM.filter(m => m.status === 'completed').length,
+        team_count: acceptedCollabs.length,
+        tech_stack: safeParse(p.tech_stack_json),
+        open_roles: safeParse(p.open_roles_json),
+        skills_needed: safeParse(p.skills_needed_json)
+      };
+    });
 
     if (recruiting === 'true' || recruiting === true) {
-      query += " AND p.open_roles_json != '[]' AND p.open_roles_json IS NOT NULL";
+      results = results.filter(p => Array.isArray(p.open_roles) && p.open_roles.length > 0);
     }
 
-    query += ' ORDER BY p.upvotes_count DESC, p.created_at DESC';
-
-    const projects = db.prepare(query).all(...params);
     return res.json({
       success: true,
-      projects: projects.map(p => formatProject(p))
+      projects: results
     });
   } catch (err) {
     console.error('Error fetching projects:', err);
@@ -90,72 +99,113 @@ function getAllProjects(req, res) {
   }
 }
 
-function getProjectById(req, res) {
+async function getProjectById(req, res) {
   try {
     const { id } = req.params;
-    const db = getDb();
 
-    const project = db.prepare(`
-      SELECT p.*, 
-        u.full_name as owner_name, 
-        u.avatar_url as owner_avatar,
-        u.department as owner_department,
-        u.email as owner_email,
-        c.title as challenge_title,
-        c.slug as challenge_slug,
-        c.grant_amount as challenge_grant
-      FROM projects p
-      JOIN users u ON p.owner_id = u.id
-      LEFT JOIN challenges c ON p.challenge_id = c.id
-      WHERE p.id = ? OR p.slug = ?
-    `).get(id, id);
+    let query = supabase
+      .from('projects')
+      .select(`
+        *,
+        users!owner_id (full_name, avatar_url, department, email),
+        challenges (title, slug, grant_amount)
+      `);
 
-    if (!project) {
+    if (id.startsWith('prj_')) {
+      query = query.eq('id', id);
+    } else {
+      query = query.or(`id.eq.${id},slug.eq.${id}`);
+    }
+
+    const { data: project, error: pError } = await query.maybeSingle();
+
+    if (pError || !project) {
       return res.status(404).json({ success: false, error: 'Project not found.' });
     }
 
     // Milestones
-    const milestones = db.prepare(`
-      SELECT * FROM milestones WHERE project_id = ? ORDER BY sort_order ASC, target_day ASC
-    `).all(project.id);
+    const { data: milestones } = await supabase
+      .from('milestones')
+      .select('*')
+      .eq('project_id', project.id)
+      .order('sort_order', { ascending: true })
+      .order('target_day', { ascending: true });
 
-    // Team members (Accepted collaborations + Owner)
-    const teamMembers = db.prepare(`
-      SELECT cb.id as collaboration_id, cb.role_applied, cb.created_at as joined_at,
-        u.id as user_id, u.full_name, u.avatar_url, u.department, u.skills_json
-      FROM collaborations cb
-      JOIN users u ON cb.user_id = u.id
-      WHERE cb.project_id = ? AND cb.status = 'accepted'
-    `).all(project.id).map(m => ({
-      ...m,
-      skills: safeParse(m.skills_json)
+    // Team members
+    const { data: collabs } = await supabase
+      .from('collaborations')
+      .select(`
+        id, role_applied, created_at,
+        users!user_id (id, full_name, avatar_url, department, skills_json)
+      `)
+      .eq('project_id', project.id)
+      .eq('status', 'accepted');
+
+    const teamMembers = (collabs || []).map(cb => ({
+      collaboration_id: cb.id,
+      role_applied: cb.role_applied,
+      joined_at: cb.created_at,
+      user_id: cb.users ? cb.users.id : null,
+      full_name: cb.users ? cb.users.full_name : null,
+      avatar_url: cb.users ? cb.users.avatar_url : null,
+      department: cb.users ? cb.users.department : null,
+      skills: cb.users ? safeParse(cb.users.skills_json) : []
     }));
 
     // Faculty Reviews
-    const reviews = db.prepare(`
-      SELECT r.*, u.full_name as reviewer_name, u.avatar_url as reviewer_avatar, u.department as reviewer_department
-      FROM reviews r
-      JOIN users u ON r.reviewer_id = u.id
-      WHERE r.project_id = ?
-      ORDER BY r.created_at DESC
-    `).all(project.id);
+    const { data: reviewsRaw } = await supabase
+      .from('reviews')
+      .select(`
+        *,
+        users!reviewer_id (full_name, avatar_url, department)
+      `)
+      .eq('project_id', project.id)
+      .order('created_at', { ascending: false });
+
+    const reviews = (reviewsRaw || []).map(r => ({
+      ...r,
+      reviewer_name: r.users ? r.users.full_name : null,
+      reviewer_avatar: r.users ? r.users.avatar_url : null,
+      reviewer_department: r.users ? r.users.department : null
+    }));
 
     // AI Copilot Evaluations
-    const aiEvaluation = db.prepare(`
-      SELECT * FROM copilot_evaluations WHERE project_id = ? ORDER BY created_at DESC LIMIT 1
-    `).get(project.id);
+    const { data: aiEvaluation } = await supabase
+      .from('copilot_evaluations')
+      .select('*')
+      .eq('project_id', project.id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     // Did current user upvote?
     let userHasUpvoted = false;
     if (req.user) {
-      const upvote = db.prepare('SELECT 1 FROM project_upvotes WHERE project_id = ? AND user_id = ?').get(project.id, req.user.id);
+      const { data: upvote } = await supabase
+        .from('project_upvotes')
+        .select('project_id')
+        .eq('project_id', project.id)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+
       userHasUpvoted = !!upvote;
     }
 
+    const formatted = {
+      ...project,
+      owner_name: project.users ? project.users.full_name : null,
+      owner_avatar: project.users ? project.users.avatar_url : null,
+      owner_department: project.users ? project.users.department : null,
+      owner_email: project.users ? project.users.email : null,
+      challenge_title: project.challenges ? project.challenges.title : null,
+      challenge_slug: project.challenges ? project.challenges.slug : null,
+      challenge_grant: project.challenges ? project.challenges.grant_amount : null
+    };
+
     return res.json({
       success: true,
-      project: formatProject(project),
-      milestones,
+      project: formatProject(formatted),
+      milestones: milestones || [],
       teamMembers,
       reviews,
       aiDiagnostic: aiEvaluation ? safeParse(aiEvaluation.diagnostic_json) : null,
@@ -167,7 +217,7 @@ function getProjectById(req, res) {
   }
 }
 
-function createProject(req, res) {
+async function createProject(req, res) {
   try {
     const {
       title,
@@ -196,76 +246,78 @@ function createProject(req, res) {
       });
     }
 
-    const db = getDb();
     const id = `prj_${crypto.randomBytes(6).toString('hex')}`;
     let slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-    
-    // Check if slug exists, append random suffix if needed
-    const existing = db.prepare('SELECT id FROM projects WHERE slug = ?').get(slug);
+
+    const { data: existing } = await supabase
+      .from('projects')
+      .select('id')
+      .eq('slug', slug)
+      .maybeSingle();
+
     if (existing) {
       slug = `${slug}-${crypto.randomBytes(3).toString('hex')}`;
     }
 
-    const insert = db.prepare(`
-      INSERT INTO projects (
-        id, title, slug, tagline, problem_statement, proposed_solution, target_users,
-        category, stage, challenge_id, owner_id, tech_stack_json, open_roles_json,
-        skills_needed_json, visibility, upvotes_count, cover_image, demo_url, repo_url
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-    `);
-
-    insert.run(
-      id, title.trim(), slug, tagline.trim(), problem_statement.trim(), proposed_solution.trim(),
-      target_users.trim(), category, stage, challenge_id || null, req.user.id,
-      JSON.stringify(Array.isArray(tech_stack) ? tech_stack : []),
-      JSON.stringify(Array.isArray(open_roles) ? open_roles : []),
-      JSON.stringify(Array.isArray(skills_needed) ? skills_needed : []),
+    const newProject = {
+      id,
+      title: title.trim(),
+      slug,
+      tagline: tagline.trim(),
+      problem_statement: problem_statement.trim(),
+      proposed_solution: proposed_solution.trim(),
+      target_users: target_users.trim(),
+      category,
+      stage,
+      challenge_id: challenge_id || null,
+      owner_id: req.user.id,
+      tech_stack_json: JSON.stringify(Array.isArray(tech_stack) ? tech_stack : []),
+      open_roles_json: JSON.stringify(Array.isArray(open_roles) ? open_roles : []),
+      skills_needed_json: JSON.stringify(Array.isArray(skills_needed) ? skills_needed : []),
       visibility,
-      cover_image || 'https://images.unsplash.com/photo-1522071820081-009f0129c71c?w=800&auto=format&fit=crop&q=80',
-      demo_url || null,
-      repo_url || null
-    );
+      upvotes_count: 0,
+      cover_image: cover_image || 'https://images.unsplash.com/photo-1522071820081-009f0129c71c?w=800&auto=format&fit=crop&q=80',
+      demo_url: demo_url || null,
+      repo_url: repo_url || null
+    };
 
-    // Insert milestones (either user provided or copilot suggested)
+    const { data: created, error } = await supabase
+      .from('projects')
+      .insert(newProject)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Milestones
     if (Array.isArray(milestones) && milestones.length > 0) {
-      const insertMilestone = db.prepare(`
-        INSERT INTO milestones (id, project_id, title, description, target_day, status, sort_order)
-        VALUES (?, ?, ?, ?, ?, 'planned', ?)
-      `);
+      const milestoneRows = milestones.map((m, idx) => ({
+        id: `mls_${crypto.randomBytes(5).toString('hex')}`,
+        project_id: id,
+        title: m.title || `Milestone ${idx + 1}`,
+        description: m.description || '',
+        target_day: m.targetDays || m.target_day || (idx + 1) * 7,
+        status: 'planned',
+        sort_order: idx + 1
+      }));
 
-      milestones.forEach((m, idx) => {
-        insertMilestone.run(
-          `mls_${crypto.randomBytes(5).toString('hex')}`,
-          id,
-          m.title || `Milestone ${idx + 1}`,
-          m.description || '',
-          m.targetDays || m.target_day || (idx + 1) * 7,
-          idx + 1
-        );
-      });
+      await supabase.from('milestones').insert(milestoneRows);
     }
 
     // Persist AI diagnostic if generated
     if (aiDiagnostic && aiDiagnostic.readinessScore) {
-      const insertCopilot = db.prepare(`
-        INSERT INTO copilot_evaluations (id, project_id, user_id, readiness_score, problem_clarity, feasibility, impact, uniqueness, diagnostic_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      insertCopilot.run(
-        `cop_${crypto.randomBytes(5).toString('hex')}`,
-        id,
-        req.user.id,
-        aiDiagnostic.readinessScore || 75,
-        aiDiagnostic.subScores?.problemClarity || 75,
-        aiDiagnostic.subScores?.feasibility || 75,
-        aiDiagnostic.subScores?.impact || 75,
-        aiDiagnostic.subScores?.uniqueness || 75,
-        JSON.stringify(aiDiagnostic)
-      );
+      await supabase.from('copilot_evaluations').insert({
+        id: `cop_${crypto.randomBytes(5).toString('hex')}`,
+        project_id: id,
+        user_id: req.user.id,
+        readiness_score: aiDiagnostic.readinessScore || 75,
+        problem_clarity: aiDiagnostic.subScores?.problemClarity || 75,
+        feasibility: aiDiagnostic.subScores?.feasibility || 75,
+        impact: aiDiagnostic.subScores?.impact || 75,
+        uniqueness: aiDiagnostic.subScores?.uniqueness || 75,
+        diagnostic_json: JSON.stringify(aiDiagnostic)
+      });
     }
-
-    const created = db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
 
     return res.status(201).json({
       success: true,
@@ -277,17 +329,20 @@ function createProject(req, res) {
   }
 }
 
-function updateProject(req, res) {
+async function updateProject(req, res) {
   try {
     const { id } = req.params;
-    const db = getDb();
 
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
-    if (!project) {
+    const { data: project, error: fetchErr } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (fetchErr || !project) {
       return res.status(404).json({ success: false, error: 'Project not found.' });
     }
 
-    // Only owner or admin can update
     if (project.owner_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ success: false, error: 'You are not authorized to update this project.' });
     }
@@ -298,80 +353,94 @@ function updateProject(req, res) {
       cover_image, demo_url, repo_url
     } = req.body;
 
-    const update = db.prepare(`
-      UPDATE projects SET
-        title = COALESCE(?, title),
-        tagline = COALESCE(?, tagline),
-        problem_statement = COALESCE(?, problem_statement),
-        proposed_solution = COALESCE(?, proposed_solution),
-        target_users = COALESCE(?, target_users),
-        category = COALESCE(?, category),
-        stage = COALESCE(?, stage),
-        tech_stack_json = COALESCE(?, tech_stack_json),
-        open_roles_json = COALESCE(?, open_roles_json),
-        skills_needed_json = COALESCE(?, skills_needed_json),
-        visibility = COALESCE(?, visibility),
-        cover_image = COALESCE(?, cover_image),
-        demo_url = COALESCE(?, demo_url),
-        repo_url = COALESCE(?, repo_url),
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `);
+    const updates = {
+      updated_at: new Date().toISOString()
+    };
 
-    update.run(
-      title ? title.trim() : null,
-      tagline ? tagline.trim() : null,
-      problem_statement ? problem_statement.trim() : null,
-      proposed_solution ? proposed_solution.trim() : null,
-      target_users ? target_users.trim() : null,
-      category || null,
-      stage || null,
-      tech_stack ? JSON.stringify(tech_stack) : null,
-      open_roles ? JSON.stringify(open_roles) : null,
-      skills_needed ? JSON.stringify(skills_needed) : null,
-      visibility || null,
-      cover_image || null,
-      demo_url || null,
-      repo_url || null,
-      id
-    );
+    if (title !== undefined) updates.title = title.trim();
+    if (tagline !== undefined) updates.tagline = tagline.trim();
+    if (problem_statement !== undefined) updates.problem_statement = problem_statement.trim();
+    if (proposed_solution !== undefined) updates.proposed_solution = proposed_solution.trim();
+    if (target_users !== undefined) updates.target_users = target_users.trim();
+    if (category !== undefined) updates.category = category;
+    if (stage !== undefined) updates.stage = stage;
+    if (tech_stack !== undefined) updates.tech_stack_json = JSON.stringify(tech_stack);
+    if (open_roles !== undefined) updates.open_roles_json = JSON.stringify(open_roles);
+    if (skills_needed !== undefined) updates.skills_needed_json = JSON.stringify(skills_needed);
+    if (visibility !== undefined) updates.visibility = visibility;
+    if (cover_image !== undefined) updates.cover_image = cover_image;
+    if (demo_url !== undefined) updates.demo_url = demo_url;
+    if (repo_url !== undefined) updates.repo_url = repo_url;
 
-    const updated = db.prepare('SELECT * FROM projects WHERE id = ?').get(id);
+    const { data: updated, error } = await supabase
+      .from('projects')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
     return res.json({
       success: true,
       project: formatProject(updated)
     });
   } catch (err) {
+    console.error('Update project error:', err);
     return res.status(500).json({ success: false, error: 'Failed to update project.' });
   }
 }
 
-function toggleUpvote(req, res) {
+async function toggleUpvote(req, res) {
   try {
     const { id } = req.params;
-    const db = getDb();
 
-    const project = db.prepare('SELECT id, upvotes_count FROM projects WHERE id = ?').get(id);
-    if (!project) {
+    const { data: project, error: pError } = await supabase
+      .from('projects')
+      .select('id, upvotes_count')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (pError || !project) {
       return res.status(404).json({ success: false, error: 'Project not found.' });
     }
 
-    const existing = db.prepare('SELECT 1 FROM project_upvotes WHERE project_id = ? AND user_id = ?').get(id, req.user.id);
+    const { data: existing } = await supabase
+      .from('project_upvotes')
+      .select('project_id')
+      .eq('project_id', id)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
 
     if (existing) {
-      // Remove upvote
-      db.prepare('DELETE FROM project_upvotes WHERE project_id = ? AND user_id = ?').run(id, req.user.id);
-      db.prepare('UPDATE projects SET upvotes_count = MAX(0, upvotes_count - 1) WHERE id = ?').run(id);
-      const updated = db.prepare('SELECT upvotes_count FROM projects WHERE id = ?').get(id);
-      return res.json({ success: true, upvoted: false, upvotes_count: updated.upvotes_count });
+      await supabase
+        .from('project_upvotes')
+        .delete()
+        .eq('project_id', id)
+        .eq('user_id', req.user.id);
+
+      const newCount = Math.max(0, (project.upvotes_count || 1) - 1);
+      await supabase
+        .from('projects')
+        .update({ upvotes_count: newCount })
+        .eq('id', id);
+
+      return res.json({ success: true, upvoted: false, upvotes_count: newCount });
     } else {
-      // Add upvote
-      db.prepare('INSERT INTO project_upvotes (project_id, user_id) VALUES (?, ?)').run(id, req.user.id);
-      db.prepare('UPDATE projects SET upvotes_count = upvotes_count + 1 WHERE id = ?').run(id);
-      const updated = db.prepare('SELECT upvotes_count FROM projects WHERE id = ?').get(id);
-      return res.json({ success: true, upvoted: true, upvotes_count: updated.upvotes_count });
+      await supabase
+        .from('project_upvotes')
+        .insert({ project_id: id, user_id: req.user.id });
+
+      const newCount = (project.upvotes_count || 0) + 1;
+      await supabase
+        .from('projects')
+        .update({ upvotes_count: newCount })
+        .eq('id', id);
+
+      return res.json({ success: true, upvoted: true, upvotes_count: newCount });
     }
   } catch (err) {
+    console.error('Toggle upvote error:', err);
     return res.status(500).json({ success: false, error: 'Failed to toggle upvote.' });
   }
 }

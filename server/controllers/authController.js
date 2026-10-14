@@ -1,8 +1,8 @@
 const crypto = require('node:crypto');
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 const { hashPassword, verifyPassword, generateToken, sanitizeUser } = require('../services/authService');
 
-function register(req, res) {
+async function register(req, res) {
   try {
     const { email, password, full_name, department, year_of_study = 1, bio = '', skills = [] } = req.body;
 
@@ -20,8 +20,13 @@ function register(req, res) {
       });
     }
 
-    const db = getDb();
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase().trim());
+    const cleanEmail = email.toLowerCase().trim();
+    const { data: existing } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', cleanEmail)
+      .maybeSingle();
+
     if (existing) {
       return res.status(409).json({
         success: false,
@@ -31,28 +36,33 @@ function register(req, res) {
 
     const userId = `usr_${crypto.randomBytes(8).toString('hex')}`;
     const { salt, hash } = hashPassword(password);
-    const role = 'student'; // Always student on open registration; mentor/admin must be assigned
+    const role = 'student';
 
-    const insert = db.prepare(`
-      INSERT INTO users (id, email, password_hash, salt, full_name, role, department, year_of_study, bio, avatar_url, skills_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    insert.run(
-      userId,
-      email.toLowerCase().trim(),
-      hash,
+    const newUser = {
+      id: userId,
+      email: cleanEmail,
+      password_hash: hash,
       salt,
-      full_name.trim(),
+      full_name: full_name.trim(),
       role,
-      department.trim(),
-      Number(year_of_study) || 1,
-      bio.trim(),
-      `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(full_name)}`,
-      JSON.stringify(Array.isArray(skills) ? skills : [])
-    );
+      department: department.trim(),
+      year_of_study: Number(year_of_study) || 1,
+      bio: bio.trim(),
+      avatar_url: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(full_name)}`,
+      skills_json: JSON.stringify(Array.isArray(skills) ? skills : [])
+    };
 
-    const createdUser = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+    const { error: insertError } = await supabase.from('users').insert(newUser);
+    if (insertError) throw insertError;
+
+    const { data: createdUser, error: fetchError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', userId)
+      .single();
+
+    if (fetchError || !createdUser) throw fetchError || new Error('Failed to retrieve created user');
+
     const safeUser = sanitizeUser(createdUser);
     const token = generateToken({ id: safeUser.id, role: safeUser.role, email: safeUser.email });
 
@@ -67,7 +77,7 @@ function register(req, res) {
   }
 }
 
-function login(req, res) {
+async function login(req, res) {
   try {
     const { email, password } = req.body;
 
@@ -78,10 +88,13 @@ function login(req, res) {
       });
     }
 
-    const db = getDb();
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase().trim());
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email.toLowerCase().trim())
+      .maybeSingle();
 
-    if (!user) {
+    if (error || !user) {
       return res.status(401).json({
         success: false,
         error: 'Invalid email or password.'
@@ -117,30 +130,42 @@ function getMe(req, res) {
   });
 }
 
-function getDemoUsers(req, res) {
+async function getDemoUsers(req, res) {
   try {
-    const db = getDb();
     const demoIds = ['usr_maya_lin', 'usr_alex_rivera', 'usr_sarah_rao', 'usr_marcus_vance'];
-    const placeholders = demoIds.map(() => '?').join(',');
-    const users = db.prepare(`SELECT * FROM users WHERE id IN (${placeholders})`).all(...demoIds);
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('*')
+      .in('id', demoIds);
 
-    const sanitized = users.map(u => sanitizeUser(u));
+    if (error) throw error;
+
+    // Preserve ordering of demoIds
+    const sorted = demoIds
+      .map(id => users.find(u => u.id === id))
+      .filter(Boolean)
+      .map(u => sanitizeUser(u));
+
     return res.json({
       success: true,
-      demoUsers: sanitized
+      demoUsers: sorted
     });
   } catch (err) {
+    console.error('Get demo users error:', err);
     return res.status(500).json({ success: false, error: 'Failed to fetch demo users.' });
   }
 }
 
-function demoLogin(req, res) {
+async function demoLogin(req, res) {
   try {
     const { userId } = req.body;
-    const db = getDb();
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', userId)
+      .maybeSingle();
 
-    if (!user) {
+    if (error || !user) {
       return res.status(404).json({
         success: false,
         error: 'Demo persona not found.'
@@ -156,6 +181,7 @@ function demoLogin(req, res) {
       token
     });
   } catch (err) {
+    console.error('Demo login error:', err);
     return res.status(500).json({ success: false, error: 'Demo switch failed.' });
   }
 }

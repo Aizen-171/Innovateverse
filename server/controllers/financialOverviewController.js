@@ -1,59 +1,80 @@
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 
-function getProjectFinancialOverview(req, res) {
+async function getProjectFinancialOverview(req, res) {
   try {
     const { projectId } = req.params;
-    const db = getDb();
 
-    const project = db.prepare('SELECT id, title, category FROM projects WHERE id = ?').get(projectId);
-    if (!project) {
+    const { data: project, error: pError } = await supabase
+      .from('projects')
+      .select('id, title, category')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    if (pError || !project) {
       return res.status(404).json({ success: false, error: 'Project not found.' });
     }
 
     // 1. Funding metrics
-    const fundingStats = db.prepare(`
-      SELECT 
-        COALESCE(SUM(requested_amount), 0) as total_requested,
-        COALESCE(SUM(approved_amount), 0) as total_approved,
-        COALESCE(SUM(disbursed_amount), 0) as total_disbursed,
-        COUNT(*) as total_requests,
-        SUM(CASE WHEN status = 'Approved' OR status = 'Released' THEN 1 ELSE 0 END) as approved_requests_count
-      FROM funding_requests
-      WHERE project_id = ?
-    `).get(projectId);
+    const { data: fundingRequests, error: fError } = await supabase
+      .from('funding_requests')
+      .select('*')
+      .eq('project_id', projectId);
+
+    if (fError) throw fError;
+
+    let totalRequested = 0;
+    let totalApproved = 0;
+    let totalDisbursed = 0;
+    let approvedRequestsCount = 0;
+
+    (fundingRequests || []).forEach(fr => {
+      totalRequested += Number(fr.requested_amount || 0);
+      totalApproved += Number(fr.approved_amount || 0);
+      totalDisbursed += Number(fr.disbursed_amount || 0);
+      if (fr.status === 'Approved' || fr.status === 'Released') {
+        approvedRequestsCount++;
+      }
+    });
 
     // 2. Expense metrics
-    const expenseStats = db.prepare(`
-      SELECT
-        COALESCE(SUM(amount), 0) as total_submitted_expenses,
-        COALESCE(SUM(CASE WHEN status = 'Verified' THEN amount ELSE 0 END), 0) as total_verified_expenses,
-        COALESCE(SUM(CASE WHEN status = 'Submitted' OR status = 'Under Verification' THEN amount ELSE 0 END), 0) as total_pending_expenses,
-        COALESCE(SUM(CASE WHEN status = 'Rejected' THEN amount ELSE 0 END), 0) as total_rejected_expenses,
-        COUNT(*) as total_expenses_count,
-        SUM(CASE WHEN status = 'Verified' THEN 1 ELSE 0 END) as verified_count
-      FROM expenses
-      WHERE project_id = ?
-    `).get(projectId);
+    const { data: expenses, error: eError } = await supabase
+      .from('expenses')
+      .select('*')
+      .eq('project_id', projectId);
 
-    // 3. Category breakdown for verified expenses
-    const categoryBreakdown = db.prepare(`
-      SELECT category, COALESCE(SUM(amount), 0) as total_amount, COUNT(*) as count
-      FROM expenses
-      WHERE project_id = ? AND status = 'Verified'
-      GROUP BY category
-    `).all(projectId);
+    if (eError) throw eError;
 
-    // 4. Accurate calculations
-    const approved = Number(fundingStats.total_approved);
-    const disbursed = Number(fundingStats.total_disbursed);
-    const verifiedExpenses = Number(expenseStats.total_verified_expenses);
-    const submittedExpenses = Number(expenseStats.total_submitted_expenses);
+    let totalSubmittedExpenses = 0;
+    let totalVerifiedExpenses = 0;
+    let totalPendingExpenses = 0;
+    let totalRejectedExpenses = 0;
+    let verifiedExpensesCount = 0;
+    const categoryTotals = {};
 
-    // Remaining Available Balance = Disbursed (or Approved if disbursed == 0) - Verified Expenses
-    const effectiveFunding = disbursed > 0 ? disbursed : approved;
-    const remainingBalance = Math.max(0, effectiveFunding - verifiedExpenses);
+    (expenses || []).forEach(exp => {
+      const amt = Number(exp.amount || 0);
+      totalSubmittedExpenses += amt;
+
+      if (exp.status === 'Verified') {
+        totalVerifiedExpenses += amt;
+        verifiedExpensesCount++;
+        categoryTotals[exp.category] = (categoryTotals[exp.category] || 0) + amt;
+      } else if (exp.status === 'Submitted' || exp.status === 'Under Verification') {
+        totalPendingExpenses += amt;
+      } else if (exp.status === 'Rejected') {
+        totalRejectedExpenses += amt;
+      }
+    });
+
+    const categoryBreakdown = Object.entries(categoryTotals).map(([cat, total]) => ({
+      category: cat,
+      total_amount: total
+    }));
+
+    const effectiveFunding = totalDisbursed > 0 ? totalDisbursed : totalApproved;
+    const remainingBalance = Math.max(0, effectiveFunding - totalVerifiedExpenses);
     const burnRatePercent = effectiveFunding > 0
-      ? Math.min(100, Math.round((verifiedExpenses / effectiveFunding) * 100))
+      ? Math.min(100, Math.round((totalVerifiedExpenses / effectiveFunding) * 100))
       : 0;
 
     return res.json({
@@ -61,17 +82,17 @@ function getProjectFinancialOverview(req, res) {
       projectId: project.id,
       projectTitle: project.title,
       financials: {
-        totalRequested: Number(fundingStats.total_requested),
-        totalApproved: approved,
-        totalDisbursed: disbursed,
-        totalSubmittedExpenses: submittedExpenses,
-        totalVerifiedExpenses: verifiedExpenses,
-        totalPendingExpenses: Number(expenseStats.total_pending_expenses),
-        totalRejectedExpenses: Number(expenseStats.total_rejected_expenses),
+        totalRequested,
+        totalApproved,
+        totalDisbursed,
+        totalSubmittedExpenses,
+        totalVerifiedExpenses,
+        totalPendingExpenses,
+        totalRejectedExpenses,
         remainingBalance,
         burnRatePercent,
-        approvedRequestsCount: Number(fundingStats.approved_requests_count),
-        verifiedExpensesCount: Number(expenseStats.verified_count),
+        approvedRequestsCount,
+        verifiedExpensesCount,
         categoryBreakdown
       }
     });

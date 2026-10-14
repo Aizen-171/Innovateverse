@@ -1,13 +1,22 @@
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 const { sanitizeUser } = require('../services/authService');
 
-function getProfile(req, res) {
+async function getProfile(req, res) {
   try {
     const { id } = req.params;
-    const db = getDb();
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id || req.user.id);
+    const targetId = id || (req.user && req.user.id);
 
-    if (!user) {
+    if (!targetId) {
+      return res.status(400).json({ success: false, error: 'User ID is required.' });
+    }
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', targetId)
+      .maybeSingle();
+
+    if (error || !user) {
       return res.status(404).json({ success: false, error: 'User profile not found.' });
     }
 
@@ -16,16 +25,16 @@ function getProfile(req, res) {
       profile: sanitizeUser(user)
     });
   } catch (err) {
+    console.error('Get profile error:', err);
     return res.status(500).json({ success: false, error: 'Failed to fetch user profile.' });
   }
 }
 
-function updateProfile(req, res) {
+async function updateProfile(req, res) {
   try {
     const { id } = req.params;
     const targetId = id || req.user.id;
 
-    // Security: Only user themselves or administrator can update profile
     if (req.user.id !== targetId && req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
@@ -46,44 +55,32 @@ function updateProfile(req, res) {
       availability
     } = req.body;
 
-    const db = getDb();
-    const existing = db.prepare('SELECT * FROM users WHERE id = ?').get(targetId);
+    const updates = {
+      updated_at: new Date().toISOString()
+    };
 
-    if (!existing) {
-      return res.status(404).json({ success: false, error: 'User profile not found.' });
+    if (full_name !== undefined) updates.full_name = full_name.trim();
+    if (department !== undefined) updates.department = department.trim();
+    if (year_of_study !== undefined) updates.year_of_study = Number(year_of_study);
+    if (bio !== undefined) updates.bio = bio.trim();
+    if (avatar_url !== undefined) updates.avatar_url = avatar_url;
+    if (skills !== undefined) updates.skills_json = JSON.stringify(Array.isArray(skills) ? skills : []);
+    if (areas_of_interest !== undefined) updates.areas_of_interest_json = JSON.stringify(Array.isArray(areas_of_interest) ? areas_of_interest : []);
+    if (preferred_roles !== undefined) updates.preferred_roles_json = JSON.stringify(Array.isArray(preferred_roles) ? preferred_roles : []);
+    if (technologies_known !== undefined) updates.technologies_known_json = JSON.stringify(Array.isArray(technologies_known) ? technologies_known : []);
+    if (availability !== undefined) updates.availability = availability.trim();
+
+    const { data: updated, error } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', targetId)
+      .select()
+      .single();
+
+    if (error || !updated) {
+      throw error || new Error('Failed to update profile');
     }
 
-    const update = db.prepare(`
-      UPDATE users SET
-        full_name = COALESCE(?, full_name),
-        department = COALESCE(?, department),
-        year_of_study = COALESCE(?, year_of_study),
-        bio = COALESCE(?, bio),
-        avatar_url = COALESCE(?, avatar_url),
-        skills_json = COALESCE(?, skills_json),
-        areas_of_interest_json = COALESCE(?, areas_of_interest_json),
-        preferred_roles_json = COALESCE(?, preferred_roles_json),
-        technologies_known_json = COALESCE(?, technologies_known_json),
-        availability = COALESCE(?, availability),
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `);
-
-    update.run(
-      full_name ? full_name.trim() : null,
-      department ? department.trim() : null,
-      year_of_study ? Number(year_of_study) : null,
-      bio !== undefined ? bio.trim() : null,
-      avatar_url || null,
-      skills ? JSON.stringify(Array.isArray(skills) ? skills : []) : null,
-      areas_of_interest ? JSON.stringify(Array.isArray(areas_of_interest) ? areas_of_interest : []) : null,
-      preferred_roles ? JSON.stringify(Array.isArray(preferred_roles) ? preferred_roles : []) : null,
-      technologies_known ? JSON.stringify(Array.isArray(technologies_known) ? technologies_known : []) : null,
-      availability ? availability.trim() : null,
-      targetId
-    );
-
-    const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(targetId);
     return res.json({
       success: true,
       message: 'Student profile updated successfully.',

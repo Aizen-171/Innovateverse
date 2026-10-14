@@ -1,7 +1,7 @@
 const crypto = require('node:crypto');
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 
-function addReview(req, res) {
+async function addReview(req, res) {
   try {
     const { projectId } = req.params;
     const {
@@ -33,34 +33,56 @@ function addReview(req, res) {
     }
 
     const totalScore = f + i + t + p;
-    const db = getDb();
 
-    const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
-    if (!project) {
+    const { data: project, error: pError } = await supabase
+      .from('projects')
+      .select('id')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    if (pError || !project) {
       return res.status(404).json({ success: false, error: 'Project not found.' });
     }
 
     const id = `rev_${crypto.randomBytes(6).toString('hex')}`;
-    const insert = db.prepare(`
-      INSERT INTO reviews (
-        id, project_id, reviewer_id, feasibility_score, impact_score,
-        technical_score, presentation_score, total_score, comments, endorsement_badge
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    const newReview = {
+      id,
+      project_id: projectId,
+      reviewer_id: req.user.id,
+      feasibility_score: f,
+      impact_score: i,
+      technical_score: t,
+      presentation_score: p,
+      total_score: totalScore,
+      comments: comments.trim(),
+      endorsement_badge: endorsement_badge || null
+    };
 
-    insert.run(id, projectId, req.user.id, f, i, t, p, totalScore, comments.trim(), endorsement_badge || null);
+    const { error: insertError } = await supabase.from('reviews').insert(newReview);
+    if (insertError) throw insertError;
 
-    const created = db.prepare(`
-      SELECT r.*, u.full_name as reviewer_name, u.avatar_url as reviewer_avatar, u.department as reviewer_department
-      FROM reviews r
-      JOIN users u ON r.reviewer_id = u.id
-      WHERE r.id = ?
-    `).get(id);
+    const { data: created, error: cError } = await supabase
+      .from('reviews')
+      .select(`
+        *,
+        users!reviewer_id (full_name, avatar_url, department)
+      `)
+      .eq('id', id)
+      .single();
+
+    if (cError) throw cError;
+
+    const formatted = {
+      ...created,
+      reviewer_name: created.users ? created.users.full_name : null,
+      reviewer_avatar: created.users ? created.users.avatar_url : null,
+      reviewer_department: created.users ? created.users.department : null
+    };
 
     return res.status(201).json({
       success: true,
       message: 'Faculty mentorship evaluation submitted successfully.',
-      review: created
+      review: formatted
     });
   } catch (err) {
     console.error('Error adding review:', err);
@@ -68,24 +90,34 @@ function addReview(req, res) {
   }
 }
 
-function getProjectReviews(req, res) {
+async function getProjectReviews(req, res) {
   try {
     const { projectId } = req.params;
-    const db = getDb();
 
-    const reviews = db.prepare(`
-      SELECT r.*, u.full_name as reviewer_name, u.avatar_url as reviewer_avatar, u.department as reviewer_department
-      FROM reviews r
-      JOIN users u ON r.reviewer_id = u.id
-      WHERE r.project_id = ?
-      ORDER BY r.created_at DESC
-    `).all(projectId);
+    const { data: reviews, error } = await supabase
+      .from('reviews')
+      .select(`
+        *,
+        users!reviewer_id (full_name, avatar_url, department)
+      `)
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const formatted = (reviews || []).map(r => ({
+      ...r,
+      reviewer_name: r.users ? r.users.full_name : null,
+      reviewer_avatar: r.users ? r.users.avatar_url : null,
+      reviewer_department: r.users ? r.users.department : null
+    }));
 
     return res.json({
       success: true,
-      reviews
+      reviews: formatted
     });
   } catch (err) {
+    console.error('Get project reviews error:', err);
     return res.status(500).json({ success: false, error: 'Failed to retrieve reviews.' });
   }
 }

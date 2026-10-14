@@ -1,7 +1,9 @@
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 const { sanitizeUser } = require('../services/authService');
 
 function safeParse(str) {
+  if (Array.isArray(str)) return str;
+  if (!str) return [];
   try {
     return JSON.parse(str) || [];
   } catch {
@@ -9,13 +11,17 @@ function safeParse(str) {
   }
 }
 
-function getCollaboratorRecommendations(req, res) {
+async function getCollaboratorRecommendations(req, res) {
   try {
     const { projectId } = req.params;
-    const db = getDb();
 
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-    if (!project) {
+    const { data: project, error: pError } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    if (pError || !project) {
       return res.status(404).json({ success: false, error: 'Project not found.' });
     }
 
@@ -24,24 +30,29 @@ function getCollaboratorRecommendations(req, res) {
     const projectCategory = (project.category || '').toLowerCase();
 
     // Find all active students and contributors excluding project owner
-    const candidates = db.prepare(`
-      SELECT * FROM users
-      WHERE role IN ('student', 'contributor') AND id != ?
-    `).all(project.owner_id);
+    const { data: candidates, error: cError } = await supabase
+      .from('users')
+      .select('*')
+      .in('role', ['student', 'contributor'])
+      .neq('id', project.owner_id);
+
+    if (cError) throw cError;
 
     // Get already applied or accepted users for this project
-    const existingCollabs = db.prepare(`
-      SELECT user_id, status, role_applied FROM collaborations WHERE project_id = ?
-    `).all(project.id);
-    const existingUserMap = new Map(existingCollabs.map(c => [c.user_id, c]));
+    const { data: existingCollabs } = await supabase
+      .from('collaborations')
+      .select('user_id, status, role_applied')
+      .eq('project_id', project.id);
 
-    const scoredCandidates = candidates.map(c => {
+    const existingUserMap = new Map((existingCollabs || []).map(c => [c.user_id, c]));
+
+    const scoredCandidates = (candidates || []).map(c => {
       const sanitized = sanitizeUser(c);
       const userSkills = (sanitized.skills || []).map(s => s.toLowerCase());
       const userRoles = (sanitized.preferred_roles || []).map(r => r.toLowerCase());
       const userInterests = (sanitized.areas_of_interest || []).map(i => i.toLowerCase());
 
-      let score = 30; // Base baseline score
+      let score = 30;
       const matchReasons = [];
 
       // 1. Skill Overlap (+15 per matching skill, max 45)
@@ -91,7 +102,6 @@ function getCollaboratorRecommendations(req, res) {
       };
     });
 
-    // Sort by compatibility score descending
     scoredCandidates.sort((a, b) => b.compatibilityScore - a.compatibilityScore);
 
     return res.json({

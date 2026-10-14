@@ -1,5 +1,5 @@
 const crypto = require('node:crypto');
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 
 const VALID_STATUSES = ['Submitted', 'Under Verification', 'Verified', 'Rejected', 'Revision Requested'];
 const VALID_CATEGORIES = [
@@ -11,7 +11,7 @@ const VALID_CATEGORIES = [
   'Miscellaneous'
 ];
 
-function submitExpense(req, res) {
+async function submitExpense(req, res) {
   try {
     const {
       project_id,
@@ -40,16 +40,24 @@ function submitExpense(req, res) {
       });
     }
 
-    const db = getDb();
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(project_id);
-    if (!project) {
+    const { data: project, error: pError } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', project_id)
+      .maybeSingle();
+
+    if (pError || !project) {
       return res.status(404).json({ success: false, error: 'Project not found.' });
     }
 
     // Must be project owner, accepted member, or admin
-    const isMember = db.prepare(`
-      SELECT 1 FROM collaborations WHERE project_id = ? AND user_id = ? AND status = 'accepted'
-    `).get(project_id, req.user.id);
+    const { data: isMember } = await supabase
+      .from('collaborations')
+      .select('id')
+      .eq('project_id', project_id)
+      .eq('user_id', req.user.id)
+      .eq('status', 'accepted')
+      .maybeSingle();
 
     if (project.owner_id !== req.user.id && !isMember && req.user.role !== 'admin') {
       return res.status(403).json({
@@ -59,28 +67,28 @@ function submitExpense(req, res) {
     }
 
     const id = `exp_${crypto.randomBytes(6).toString('hex')}`;
-    const insert = db.prepare(`
-      INSERT INTO expenses (
-        id, project_id, student_id, title, amount, category, expense_date,
-        vendor, description, receipt_filename, receipt_url, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted')
-    `);
-
-    insert.run(
+    const newExpense = {
       id,
       project_id,
-      req.user.id,
-      title.trim(),
-      amt,
+      student_id: req.user.id,
+      title: title.trim(),
+      amount: amt,
       category,
       expense_date,
-      vendor.trim(),
-      description.trim(),
-      receipt_filename || `${title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_receipt.pdf`,
-      receipt_url || `https://files.campus.edu/receipts/${id}.pdf`
-    );
+      vendor: vendor.trim(),
+      description: description.trim(),
+      receipt_filename: receipt_filename || `${title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_receipt.pdf`,
+      receipt_url: receipt_url || `https://files.campus.edu/receipts/${id}.pdf`,
+      status: 'Submitted'
+    };
 
-    const created = db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
+    const { data: created, error: insertError } = await supabase
+      .from('expenses')
+      .insert(newExpense)
+      .select()
+      .single();
+
+    if (insertError) throw insertError;
 
     return res.status(201).json({
       success: true,
@@ -93,64 +101,85 @@ function submitExpense(req, res) {
   }
 }
 
-function getProjectExpenses(req, res) {
+async function getProjectExpenses(req, res) {
   try {
     const { projectId } = req.params;
-    const db = getDb();
 
-    const expenses = db.prepare(`
-      SELECT e.*,
-        u.full_name as submitter_name,
-        v.full_name as reviewer_name
-      FROM expenses e
-      JOIN users u ON e.student_id = u.id
-      LEFT JOIN users v ON e.verified_by = v.id
-      WHERE e.project_id = ?
-      ORDER BY e.expense_date DESC, e.created_at DESC
-    `).all(projectId);
+    const { data: expenses, error } = await supabase
+      .from('expenses')
+      .select(`
+        *,
+        submitter:users!student_id (full_name),
+        reviewer:users!verified_by (full_name)
+      `)
+      .eq('project_id', projectId)
+      .order('expense_date', { ascending: false })
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const formatted = (expenses || []).map(e => ({
+      ...e,
+      submitter_name: e.submitter ? e.submitter.full_name : null,
+      reviewer_name: e.reviewer ? e.reviewer.full_name : null
+    }));
 
     return res.json({
       success: true,
-      expenses
+      expenses: formatted
     });
   } catch (err) {
+    console.error('Get project expenses error:', err);
     return res.status(500).json({ success: false, error: 'Failed to retrieve project expenses.' });
   }
 }
 
-function getAllExpensesQueue(req, res) {
+async function getAllExpensesQueue(req, res) {
   try {
     if (req.user.role !== 'mentor' && req.user.role !== 'admin') {
       return res.status(403).json({ success: false, error: 'Access restricted to financial reviewers.' });
     }
 
-    const db = getDb();
-    const expenses = db.prepare(`
-      SELECT e.*,
-        p.title as project_title,
-        p.category as project_category,
-        u.full_name as submitter_name,
-        u.email as submitter_email,
-        u.department as submitter_department,
-        v.full_name as reviewer_name
-      FROM expenses e
-      JOIN projects p ON e.project_id = p.id
-      JOIN users u ON e.student_id = u.id
-      LEFT JOIN users v ON e.verified_by = v.id
-      ORDER BY
-        CASE e.status
-          WHEN 'Submitted' THEN 1
-          WHEN 'Under Verification' THEN 2
-          WHEN 'Revision Requested' THEN 3
-          WHEN 'Verified' THEN 4
-          ELSE 5
-        END,
-        e.created_at DESC
-    `).all();
+    const { data: expenses, error } = await supabase
+      .from('expenses')
+      .select(`
+        *,
+        projects!project_id (title, category),
+        submitter:users!student_id (full_name, email, department),
+        reviewer:users!verified_by (full_name)
+      `)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const statusPriority = {
+      'Submitted': 1,
+      'Under Verification': 2,
+      'Revision Requested': 3,
+      'Verified': 4,
+      'Rejected': 5
+    };
+
+    const formatted = (expenses || []).map(e => ({
+      ...e,
+      project_title: e.projects ? e.projects.title : null,
+      project_category: e.projects ? e.projects.category : null,
+      submitter_name: e.submitter ? e.submitter.full_name : null,
+      submitter_email: e.submitter ? e.submitter.email : null,
+      submitter_department: e.submitter ? e.submitter.department : null,
+      reviewer_name: e.reviewer ? e.reviewer.full_name : null
+    }));
+
+    formatted.sort((a, b) => {
+      const prioA = statusPriority[a.status] || 6;
+      const prioB = statusPriority[b.status] || 6;
+      if (prioA !== prioB) return prioA - prioB;
+      return new Date(b.created_at) - new Date(a.created_at);
+    });
 
     return res.json({
       success: true,
-      expenseQueue: expenses
+      expenseQueue: formatted
     });
   } catch (err) {
     console.error('Error fetching expense queue:', err);
@@ -158,7 +187,7 @@ function getAllExpensesQueue(req, res) {
   }
 }
 
-function verifyExpense(req, res) {
+async function verifyExpense(req, res) {
   try {
     const { id } = req.params;
     const { status, reviewer_comments } = req.body;
@@ -170,7 +199,6 @@ function verifyExpense(req, res) {
       });
     }
 
-    // Role check: Only admin or mentor
     if (req.user.role !== 'admin' && req.user.role !== 'mentor') {
       return res.status(403).json({
         success: false,
@@ -178,26 +206,32 @@ function verifyExpense(req, res) {
       });
     }
 
-    const db = getDb();
-    const existing = db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
+    const { data: existing, error: fetchErr } = await supabase
+      .from('expenses')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
 
-    if (!existing) {
+    if (fetchErr || !existing) {
       return res.status(404).json({ success: false, error: 'Expense record not found.' });
     }
 
-    const update = db.prepare(`
-      UPDATE expenses SET
-        status = ?,
-        reviewer_comments = COALESCE(?, reviewer_comments),
-        verified_by = ?,
-        verified_at = CURRENT_TIMESTAMP,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `);
+    const updates = {
+      status,
+      verified_by: req.user.id,
+      verified_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    if (reviewer_comments !== undefined) updates.reviewer_comments = reviewer_comments ? reviewer_comments.trim() : null;
 
-    update.run(status, reviewer_comments ? reviewer_comments.trim() : null, req.user.id, id);
+    const { data: updated, error: updateError } = await supabase
+      .from('expenses')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
 
-    const updated = db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
+    if (updateError) throw updateError;
 
     return res.json({
       success: true,

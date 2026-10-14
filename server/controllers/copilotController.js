@@ -1,8 +1,8 @@
 const crypto = require('node:crypto');
 const { evaluateIdea } = require('../services/aiEngine');
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 
-function evaluate(req, res) {
+async function evaluate(req, res) {
   try {
     const {
       title,
@@ -23,7 +23,6 @@ function evaluate(req, res) {
       });
     }
 
-    // Run AI diagnostic engine
     const diagnostic = evaluateIdea({
       title,
       tagline,
@@ -35,29 +34,20 @@ function evaluate(req, res) {
       skills_needed
     });
 
-    // Optionally save to database if projectId and authenticated user exist
     if (projectId && req.user) {
       try {
-        const db = getDb();
         const id = `cop_${crypto.randomBytes(5).toString('hex')}`;
-        const insert = db.prepare(`
-          INSERT INTO copilot_evaluations (
-            id, project_id, user_id, readiness_score, problem_clarity,
-            feasibility, impact, uniqueness, diagnostic_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-
-        insert.run(
+        await supabase.from('copilot_evaluations').insert({
           id,
-          projectId,
-          req.user.id,
-          diagnostic.readinessScore,
-          diagnostic.subScores.problemClarity,
-          diagnostic.subScores.feasibility,
-          diagnostic.subScores.impact,
-          diagnostic.subScores.uniqueness,
-          JSON.stringify(diagnostic)
-        );
+          project_id: projectId,
+          user_id: req.user.id,
+          readiness_score: diagnostic.readinessScore,
+          problem_clarity: diagnostic.subScores?.problemClarity || 75,
+          feasibility: diagnostic.subScores?.feasibility || 75,
+          impact: diagnostic.subScores?.impact || 75,
+          uniqueness: diagnostic.subScores?.uniqueness || 75,
+          diagnostic_json: JSON.stringify(diagnostic)
+        });
       } catch (saveErr) {
         console.warn('Could not persist copilot evaluation to DB:', saveErr.message);
       }

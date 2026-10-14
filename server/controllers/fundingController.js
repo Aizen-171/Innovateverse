@@ -1,9 +1,11 @@
 const crypto = require('node:crypto');
-const { getDb } = require('../config/database');
+const { supabase } = require('../config/supabaseClient');
 
 const VALID_STATUSES = ['Draft', 'Submitted', 'Under Review', 'Approved', 'Rejected', 'Revision Requested', 'Released'];
 
 function safeParse(str) {
+  if (Array.isArray(str)) return str;
+  if (!str) return [];
   try {
     return JSON.parse(str) || [];
   } catch {
@@ -11,7 +13,7 @@ function safeParse(str) {
   }
 }
 
-function createFundingRequest(req, res) {
+async function createFundingRequest(req, res) {
   try {
     const {
       project_id,
@@ -30,37 +32,42 @@ function createFundingRequest(req, res) {
       });
     }
 
-    const db = getDb();
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(project_id);
-    if (!project) {
+    const { data: project, error: pError } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', project_id)
+      .maybeSingle();
+
+    if (pError || !project) {
       return res.status(404).json({ success: false, error: 'Project not found.' });
     }
 
-    // Must be project owner or admin
     if (project.owner_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ success: false, error: 'Only the project lead can submit grant funding requests.' });
     }
 
     const id = `fnd_${crypto.randomBytes(6).toString('hex')}`;
-    const insert = db.prepare(`
-      INSERT INTO funding_requests (
-        id, project_id, student_id, requested_amount, currency, purpose,
-        expected_benefit, itemized_budget_json, status, approved_amount, disbursed_amount
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Submitted', 0, 0)
-    `);
-
-    insert.run(
+    const newRequest = {
       id,
       project_id,
-      req.user.id,
-      amount,
+      student_id: req.user.id,
+      requested_amount: amount,
       currency,
-      purpose.trim(),
-      expected_benefit.trim(),
-      JSON.stringify(Array.isArray(itemized_budget) ? itemized_budget : [])
-    );
+      purpose: purpose.trim(),
+      expected_benefit: expected_benefit.trim(),
+      itemized_budget_json: JSON.stringify(Array.isArray(itemized_budget) ? itemized_budget : []),
+      status: 'Submitted',
+      approved_amount: 0,
+      disbursed_amount: 0
+    };
 
-    const created = db.prepare('SELECT * FROM funding_requests WHERE id = ?').get(id);
+    const { data: created, error: insertError } = await supabase
+      .from('funding_requests')
+      .insert(newRequest)
+      .select()
+      .single();
+
+    if (insertError) throw insertError;
 
     return res.status(201).json({
       success: true,
@@ -76,24 +83,26 @@ function createFundingRequest(req, res) {
   }
 }
 
-function getProjectFunding(req, res) {
+async function getProjectFunding(req, res) {
   try {
     const { projectId } = req.params;
-    const db = getDb();
 
-    const requests = db.prepare(`
-      SELECT fr.*,
-        u.full_name as student_name,
-        r.full_name as reviewer_name
-      FROM funding_requests fr
-      JOIN users u ON fr.student_id = u.id
-      LEFT JOIN users r ON fr.reviewer_id = r.id
-      WHERE fr.project_id = ?
-      ORDER BY fr.created_at DESC
-    `).all(projectId);
+    const { data: requests, error } = await supabase
+      .from('funding_requests')
+      .select(`
+        *,
+        users!student_id (full_name),
+        reviewer:users!reviewer_id (full_name)
+      `)
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false });
 
-    const formatted = requests.map(fr => ({
+    if (error) throw error;
+
+    const formatted = (requests || []).map(fr => ({
       ...fr,
+      student_name: fr.users ? fr.users.full_name : null,
+      reviewer_name: fr.reviewer ? fr.reviewer.full_name : null,
       itemized_budget: safeParse(fr.itemized_budget_json)
     }));
 
@@ -102,49 +111,59 @@ function getProjectFunding(req, res) {
       fundingRequests: formatted
     });
   } catch (err) {
+    console.error('Get project funding error:', err);
     return res.status(500).json({ success: false, error: 'Failed to fetch funding requests.' });
   }
 }
 
-function getAllFundingQueue(req, res) {
+async function getAllFundingQueue(req, res) {
   try {
-    // Only reviewers and admins
     if (req.user.role !== 'mentor' && req.user.role !== 'admin') {
       return res.status(403).json({ success: false, error: 'Access restricted to authorized grant reviewers.' });
     }
 
-    const db = getDb();
-    const requests = db.prepare(`
-      SELECT fr.*,
-        p.title as project_title,
-        p.category as project_category,
-        p.stage as project_stage,
-        u.full_name as student_name,
-        u.email as student_email,
-        u.department as student_department,
-        r.full_name as reviewer_name
-      FROM funding_requests fr
-      JOIN projects p ON fr.project_id = p.id
-      JOIN users u ON fr.student_id = u.id
-      LEFT JOIN users r ON fr.reviewer_id = r.id
-      ORDER BY 
-        CASE fr.status
-          WHEN 'Submitted' THEN 1
-          WHEN 'Under Review' THEN 2
-          WHEN 'Revision Requested' THEN 3
-          WHEN 'Approved' THEN 4
-          WHEN 'Released' THEN 5
-          ELSE 6
-        END,
-        fr.created_at DESC
-    `).all();
+    const { data: requests, error } = await supabase
+      .from('funding_requests')
+      .select(`
+        *,
+        projects!project_id (title, category, stage),
+        users!student_id (full_name, email, department),
+        reviewer:users!reviewer_id (full_name)
+      `)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const statusPriority = {
+      'Submitted': 1,
+      'Under Review': 2,
+      'Revision Requested': 3,
+      'Approved': 4,
+      'Released': 5
+    };
+
+    const formatted = (requests || []).map(r => ({
+      ...r,
+      project_title: r.projects ? r.projects.title : null,
+      project_category: r.projects ? r.projects.category : null,
+      project_stage: r.projects ? r.projects.stage : null,
+      student_name: r.users ? r.users.full_name : null,
+      student_email: r.users ? r.users.email : null,
+      student_department: r.users ? r.users.department : null,
+      reviewer_name: r.reviewer ? r.reviewer.full_name : null,
+      itemized_budget: safeParse(r.itemized_budget_json)
+    }));
+
+    formatted.sort((a, b) => {
+      const prioA = statusPriority[a.status] || 6;
+      const prioB = statusPriority[b.status] || 6;
+      if (prioA !== prioB) return prioA - prioB;
+      return new Date(b.created_at) - new Date(a.created_at);
+    });
 
     return res.json({
       success: true,
-      fundingQueue: requests.map(r => ({
-        ...r,
-        itemized_budget: safeParse(r.itemized_budget_json)
-      }))
+      fundingQueue: formatted
     });
   } catch (err) {
     console.error('Error fetching funding queue:', err);
@@ -152,7 +171,7 @@ function getAllFundingQueue(req, res) {
   }
 }
 
-function reviewFundingRequest(req, res) {
+async function reviewFundingRequest(req, res) {
   try {
     const { id } = req.params;
     const {
@@ -169,7 +188,6 @@ function reviewFundingRequest(req, res) {
       });
     }
 
-    // Role Enforcement: strictly admin or mentor
     if (req.user.role !== 'admin' && req.user.role !== 'mentor') {
       return res.status(403).json({
         success: false,
@@ -177,31 +195,37 @@ function reviewFundingRequest(req, res) {
       });
     }
 
-    const db = getDb();
-    const existing = db.prepare('SELECT * FROM funding_requests WHERE id = ?').get(id);
+    const { data: existing, error: fetchErr } = await supabase
+      .from('funding_requests')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
 
-    if (!existing) {
+    if (fetchErr || !existing) {
       return res.status(404).json({ success: false, error: 'Funding request not found.' });
     }
 
     const appAmt = approved_amount !== undefined ? Number(approved_amount) : existing.approved_amount;
     const disbAmt = disbursed_amount !== undefined ? Number(disbursed_amount) : existing.disbursed_amount;
 
-    const update = db.prepare(`
-      UPDATE funding_requests SET
-        status = ?,
-        approved_amount = ?,
-        disbursed_amount = ?,
-        reviewer_notes = COALESCE(?, reviewer_notes),
-        reviewer_id = ?,
-        decided_at = CURRENT_TIMESTAMP,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `);
+    const updates = {
+      status,
+      approved_amount: appAmt,
+      disbursed_amount: disbAmt,
+      reviewer_id: req.user.id,
+      decided_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    if (reviewer_notes !== undefined) updates.reviewer_notes = reviewer_notes ? reviewer_notes.trim() : null;
 
-    update.run(status, appAmt, disbAmt, reviewer_notes ? reviewer_notes.trim() : null, req.user.id, id);
+    const { data: updated, error: updateError } = await supabase
+      .from('funding_requests')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
 
-    const updated = db.prepare('SELECT * FROM funding_requests WHERE id = ?').get(id);
+    if (updateError) throw updateError;
 
     return res.json({
       success: true,
