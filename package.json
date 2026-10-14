@@ -5,16 +5,22 @@
   "scripts": {
     "start": "node server/server.js",
     "test": "node server/tests/api.test.js",
-    "build": "npm --prefix client run build",
+    "build": "cd client && npm install && npm run build",
     "client:dev": "npm --prefix client run dev",
     "server:dev": "npm --prefix server run dev"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
   },
   "keywords": [
     "campus-innovation",
     "ai-copilot",
     "hackathon",
     "react",
-    "sqlite"
+    "supabase"
   ],
   "author": "InnovateVerse Engineering Team",
   "license": "MIT"
