@@ -43,7 +43,7 @@ Run the unified server (serves both API and the compiled React production client
 ```bash
 node server/server.js
 ```
-Open **[http://localhost:5000]((https://6acf570d1a1ca4b6413a17f5--grand-biscotti-3a9502.netlify.app/))** in your browser!
+Open **[(https://6acf570d1a1ca4b6413a17f5--grand-biscotti-3a9502.netlify.app/)]** in your browser!
 
 ### 3. Reviewer One-Click Persona Switcher
 Use the top banner to test the full lifecycle across personas:
@@ -86,11 +86,3 @@ innovateverse/
 ```
 
 ---
-
-## 🏆 Hackathon Demo Walkthrough (4 Minutes)
-
-1. **Discovery (0:00 - 0:45):** Open Landing Page -> Explore "Smart Campus Transit" challenge.
-2. **AI Copilot (0:45 - 1:45):** Switch to Maya Lin -> Submit proposal -> Run **AI Innovation Copilot** -> Audit assumptions & adopt generated 4-week milestones.
-3. **Collaboration (1:45 - 2:30):** Switch to Alex Rivera -> Filter Explorer by `Embedded C / IoT` -> Apply to EcoTransit AI -> Switch to Maya -> Accept Alex's request.
-4. **Execution (2:30 - 3:15):** Open Workspace -> Toggle milestone checkmarks -> Observe velocity bar update.
-5. **Faculty Rigor (3:15 - 3:45):** Switch to Dr. Sarah Rao -> Submit 4-point rubric review (18/20) -> Award "Faculty Approved Innovation" badge -> View in Showcase.
