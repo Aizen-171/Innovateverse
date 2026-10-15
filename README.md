@@ -43,7 +43,7 @@ Run the unified server (serves both API and the compiled React production client
 ```bash
 node server/server.js
 ```
-Open **[http://localhost:5000](http://localhost:5000)** in your browser!
+Open **[http://localhost:5000]((https://6acf570d1a1ca4b6413a17f5--grand-biscotti-3a9502.netlify.app/))** in your browser!
 
 ### 3. Reviewer One-Click Persona Switcher
 Use the top banner to test the full lifecycle across personas:
